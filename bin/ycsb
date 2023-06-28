@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/bin/sh
 #
-# Copyright (c) 2012 - 2020 YCSB contributors. All rights reserved.
+# Copyright (c) 2012 - 2016 YCSB contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -15,311 +15,246 @@
 # permissions and limitations under the License. See accompanying
 # LICENSE file.
 #
+# -----------------------------------------------------------------------------
+# Control Script for YCSB
+#
+# Environment Variable Prerequisites
+#
+#   Do not set the variables in this script. Instead put them into a script
+#   setenv.sh in YCSB_HOME/bin to keep your customizations separate.
+#
+#   YCSB_HOME       (Optional) YCSB installation directory.  If not set
+#                   this script will use the parent directory of where this
+#                   script is run from.
+#
+#   JAVA_HOME       (Optional) Must point at your Java Development Kit
+#                   installation.  If empty, this script tries use the
+#                   available java executable.
+#
+#   JAVA_OPTS       (Optional) Java runtime options used when any command
+#                   is executed.
+#
+#   WARNING!!! YCSB home must be located in a directory path that doesn't
+#   contain spaces.
+#
+#        www.shellcheck.net was used to validate this script
 
-import errno
-import fnmatch
-import io
-import os
-import shlex
-import sys
-import subprocess
+# Cygwin support
+CYGWIN=false
+case "$(uname)" in
+CYGWIN*) CYGWIN=true;;
+esac
 
-try:
-    mod = __import__('argparse')
-    import argparse
-except ImportError:
-    print >> sys.stderr, '[ERROR] argparse not found. Try installing it via "pip".'
-    exit(1)
+# Get script path
+SCRIPT_DIR=$(dirname "$0" 2>/dev/null)
 
-BASE_URL = "https://github.com/brianfrankcooper/YCSB/tree/master/"
-COMMANDS = {
-    "shell" : {
-        "command"     : "",
-        "description" : "Interactive mode",
-        "main"        : "site.ycsb.CommandLine",
-    },
-    "load" : {
-        "command"     : "-load",
-        "description" : "Execute the load phase",
-        "main"        : "site.ycsb.Client",
-    },
-    "run" : {
-        "command"     : "-t",
-        "description" : "Execute the transaction phase",
-        "main"        : "site.ycsb.Client",
-    },
-}
+# Only set YCSB_HOME if not already set
+[ -z "$YCSB_HOME" ] && YCSB_HOME=$(cd "$SCRIPT_DIR/.." || exit; pwd)
 
-DATABASES = {
-    "accumulo1.9"     : "site.ycsb.db.accumulo.AccumuloClient",
-    "aerospike"    : "site.ycsb.db.AerospikeClient",
-    "arangodb"     : "site.ycsb.db.arangodb.ArangoDBClient",
-    "arangodb3"     : "site.ycsb.db.arangodb.ArangoDBClient",
-    "asynchbase"   : "site.ycsb.db.AsyncHBaseClient",
-    "azurecosmos" : "site.ycsb.db.AzureCosmosClient",
-    "azuretablestorage" : "site.ycsb.db.azuretablestorage.AzureClient",
-    "basic"        : "site.ycsb.BasicDB",
-    "basicts"      : "site.ycsb.BasicTSDB",
-    "cassandra-cql": "site.ycsb.db.CassandraCQLClient",
-    "cassandra2-cql": "site.ycsb.db.CassandraCQLClient",
-    "cloudspanner" : "site.ycsb.db.cloudspanner.CloudSpannerClient",
-    "couchbase"    : "site.ycsb.db.CouchbaseClient",
-    "couchbase2"   : "site.ycsb.db.couchbase2.Couchbase2Client",
-    "crail"        : "site.ycsb.db.crail.CrailClient",
-    "dynamodb"     : "site.ycsb.db.DynamoDBClient",
-    "elasticsearch": "site.ycsb.db.ElasticsearchClient",
-    "elasticsearch5": "site.ycsb.db.elasticsearch5.ElasticsearchClient",
-    "elasticsearch5-rest": "site.ycsb.db.elasticsearch5.ElasticsearchRestClient",
-    "foundationdb" : "site.ycsb.db.foundationdb.FoundationDBClient",
-    "geode"        : "site.ycsb.db.GeodeClient",
-    "googlebigtable"  : "site.ycsb.db.GoogleBigtableClient",
-    "googledatastore" : "site.ycsb.db.GoogleDatastoreClient",
-    "griddb"       : "site.ycsb.db.griddb.GridDBClient",
-    "hbase1"      : "site.ycsb.db.hbase1.HBaseClient1",
-    "hbase2"      : "site.ycsb.db.hbase2.HBaseClient2",
-    "ignite"       : "site.ycsb.db.ignite.IgniteClient",
-    "ignite-sql"   : "site.ycsb.db.ignite.IgniteSqlClient",
-    "infinispan-cs": "site.ycsb.db.InfinispanRemoteClient",
-    "infinispan"   : "site.ycsb.db.InfinispanClient",
-    "jdbc"         : "site.ycsb.db.JdbcDBClient",
-    "kudu"         : "site.ycsb.db.KuduYCSBClient",
-    "memcached"    : "site.ycsb.db.MemcachedClient",
-    "maprdb"       : "site.ycsb.db.mapr.MapRDBClient",
-    "maprjsondb"   : "site.ycsb.db.mapr.MapRJSONDBClient",
-    "mongodb"      : "site.ycsb.db.MongoDbClient",
-    "mongodb-async": "site.ycsb.db.AsyncMongoDbClient",
-    "nosqldb"      : "site.ycsb.db.NoSqlDbClient",
-    "orientdb"     : "site.ycsb.db.OrientDBClient",
-    "postgrenosql" : "site.ycsb.postgrenosql.PostgreNoSQLDBClient",
-    "rados"        : "site.ycsb.db.RadosClient",
-    "redis"        : "site.ycsb.db.RedisClient",
-    "rest"         : "site.ycsb.webservice.rest.RestClient",
-    "riak"         : "site.ycsb.db.riak.RiakKVClient",
-    "rocksdb"      : "site.ycsb.db.rocksdb.RocksDBClient",
-    "s3"           : "site.ycsb.db.S3Client",
-    "seaweedfs"    : "site.ycsb.db.seaweed.SeaweedClient",
-    "scylla"       : "site.ycsb.db.scylla.ScyllaCQLClient",
-    "solr7"        : "site.ycsb.db.solr7.SolrClient",
-    "tarantool"    : "site.ycsb.db.TarantoolClient",
-    "tablestore"   : "site.ycsb.db.tablestore.TableStoreClient",
-    "zookeeper"    : "site.ycsb.db.zookeeper.ZKClient"
-}
+# Ensure that any extra CLASSPATH variables are set via setenv.sh
+CLASSPATH=
 
-OPTIONS = {
-    "-P file"        : "Specify workload file",
-    "-p key=value"   : "Override workload property",
-    "-s"             : "Print status to stderr",
-    "-target n"      : "Target ops/sec (default: unthrottled)",
-    "-threads n"     : "Number of client threads (default: 1)",
-    "-cp path"       : "Additional Java classpath entries",
-    "-jvm-args args" : "Additional arguments to the JVM",
-}
+# Pull in customization options
+if [ -r "$YCSB_HOME/bin/setenv.sh" ]; then
+  # Shellcheck wants a source, but this directive only runs if available
+  #   So, tell shellcheck to ignore
+  # shellcheck source=/dev/null
+  . "$YCSB_HOME/bin/setenv.sh"
+fi
 
-def usage():
-    output = io.BytesIO()
-    print >> output, "%s command database [options]" % sys.argv[0]
+# Attempt to find the available JAVA, if JAVA_HOME not set
+if [ -z "$JAVA_HOME" ]; then
+  JAVA_PATH=$(which java 2>/dev/null)
+  if [ "x$JAVA_PATH" != "x" ]; then
+    JAVA_HOME=$(dirname "$(dirname "$JAVA_PATH" 2>/dev/null)")
+  fi
+fi
 
-    print >> output, "\nCommands:"
-    for command in sorted(COMMANDS.keys()):
-        print >> output, "    %s %s" % (command.ljust(14),
-                                        COMMANDS[command]["description"])
+# If JAVA_HOME still not set, error
+if [ -z "$JAVA_HOME" ]; then
+  echo "[ERROR] Java executable not found. Exiting."
+  exit 1;
+fi
 
-    print >> output, "\nDatabases:"
-    for db in sorted(DATABASES.keys()):
-        print >> output, "    %s %s" % (db.ljust(14), BASE_URL +
-                                        db.split("-")[0])
+# Determine YCSB command argument
+if [ "load" = "$1" ] ; then
+  YCSB_COMMAND=-load
+  YCSB_CLASS=site.ycsb.Client
+elif [ "run" = "$1" ] ; then
+  YCSB_COMMAND=-t
+  YCSB_CLASS=site.ycsb.Client
+elif [ "shell" = "$1" ] ; then
+  YCSB_COMMAND=
+  YCSB_CLASS=site.ycsb.CommandLine
+else
+  echo "[ERROR] Found unknown command '$1'"
+  echo "[ERROR] Expected one of 'load', 'run', or 'shell'. Exiting."
+  exit 1;
+fi
 
-    print >> output, "\nOptions:"
-    for option in sorted(OPTIONS.keys()):
-        print >> output, "    %s %s" % (option.ljust(14), OPTIONS[option])
+# Find binding information
+BINDING_LINE=$(grep "^$2:" "$YCSB_HOME/bin/bindings.properties" -m 1)
 
-    print >> output, """\nWorkload Files:
-    There are various predefined workloads under workloads/ directory.
-    See https://github.com/brianfrankcooper/YCSB/wiki/Core-Properties
-    for the list of workload properties."""
+if [ -z "$BINDING_LINE" ] ; then
+  echo "[ERROR] The specified binding '$2' was not found.  Exiting."
+  exit 1;
+fi
 
-    return output.getvalue()
+# Get binding name and class
+BINDING_NAME=$(echo "$BINDING_LINE" | cut -d':' -f1)
+BINDING_CLASS=$(echo "$BINDING_LINE" | cut -d':' -f2)
 
-# Python 2.6 doesn't have check_output. Add the method as it is in Python 2.7
-# Based on https://github.com/python/cpython/blob/2.7/Lib/subprocess.py#L545
-def check_output(*popenargs, **kwargs):
-    r"""Run command with arguments and return its output as a byte string.
+# Some bindings have multiple versions that are managed in the same directory.
+#   They are noted with a '-' after the binding name.
+#   (e.g. cassandra-7 & cassandra-8)
+BINDING_DIR=$(echo "$BINDING_NAME" | cut -d'-' -f1)
 
-    If the exit code was non-zero it raises a CalledProcessError.  The
-    CalledProcessError object will have the return code in the returncode
-    attribute and output in the output attribute.
+# The 'basic' binding is core functionality
+if [ "$BINDING_NAME" = "basic" ] ; then
+  BINDING_DIR=core
+fi
 
-    The arguments are the same as for the Popen constructor.  Example:
+# For Cygwin, ensure paths are in UNIX format before anything is touched
+if $CYGWIN; then
+  [ -n "$JAVA_HOME" ] && JAVA_HOME=$(cygpath --unix "$JAVA_HOME")
+  [ -n "$CLASSPATH" ] && CLASSPATH=$(cygpath --path --unix "$CLASSPATH")
+fi
 
-    >>> check_output(["ls", "-l", "/dev/null"])
-    'crw-rw-rw- 1 root root 1, 3 Oct 18  2007 /dev/null\n'
+# Check if source checkout, or release distribution
+DISTRIBUTION=true
+if [ -r "$YCSB_HOME/pom.xml" ]; then
+  DISTRIBUTION=false;
+fi
 
-    The stdout argument is not allowed as it is used internally.
-    To capture standard error in the result, use stderr=STDOUT.
+# Add Top level conf to classpath
+if [ -z "$CLASSPATH" ] ; then
+  CLASSPATH="$YCSB_HOME/conf"
+else
+  CLASSPATH="$CLASSPATH:$YCSB_HOME/conf"
+fi
 
-    >>> check_output(["/bin/sh", "-c",
-    ...               "ls -l non_existent_file ; exit 0"],
-    ...              stderr=STDOUT)
-    'ls: non_existent_file: No such file or directory\n'
-    """
-    if 'stdout' in kwargs:
-        raise ValueError('stdout argument not allowed, it will be overridden.')
-    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
-    output, unused_err = process.communicate()
-    retcode = process.poll()
-    if retcode:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        error = subprocess.CalledProcessError(retcode, cmd)
-        error.output = output
-        raise error
-    return output
+# Cassandra2 deprecation message
+if [ "${BINDING_DIR}" = "cassandra2" ] ; then
+  echo "[WARN] The 'cassandra2-cql' client has been deprecated. It has been \
+renamed to simply 'cassandra-cql'. This alias will be removed  in the next \
+YCSB release."
+  BINDING_DIR="cassandra"
+fi
 
-def debug(message):
-    print >> sys.stderr, "[DEBUG] ", message
+# hbase14 replaced by hbas1
+if [ "${BINDING_DIR}" = "hbase14" ] ; then
+  echo "[WARN] The 'hbase14' client has been deprecated. HBase 1.y users should \
+rely on the 'hbase1' client instead."
+  BINDING_DIR="hbase1"
+fi
 
-def warn(message):
-    print >> sys.stderr, "[WARN] ", message
+# arangodb3 deprecation message
+if [ "${BINDING_DIR}" = "arangodb3" ] ; then
+  echo "[WARN] The 'arangodb3' client has been deprecated. The binding 'arangodb' \
+now covers every ArangoDB version. This alias will be removed \
+in the next YCSB release."
+  BINDING_DIR="arangodb"
+fi
 
-def error(message):
-    print >> sys.stderr, "[ERROR] ", message
+# Build classpath
+#   The "if" check after the "for" is because glob may just return the pattern
+#   when no files are found.  The "if" makes sure the file is really there.
+if $DISTRIBUTION; then
+  # Core libraries
+  for f in "$YCSB_HOME"/lib/*.jar ; do
+    if [ -r "$f" ] ; then
+      CLASSPATH="$CLASSPATH:$f"
+    fi
+  done
 
-def find_jars(dir, glob='*.jar'):
-    jars = []
-    for (dirpath, dirnames, filenames) in os.walk(dir):
-        for filename in fnmatch.filter(filenames, glob):
-            jars.append(os.path.join(dirpath, filename))
-    return jars
+  # Database conf dir
+  if [ -r "$YCSB_HOME"/"$BINDING_DIR"-binding/conf ] ; then
+    CLASSPATH="$CLASSPATH:$YCSB_HOME/$BINDING_DIR-binding/conf"
+  fi
 
-def get_ycsb_home():
-    dir = os.path.abspath(os.path.dirname(sys.argv[0]))
-    while "LICENSE.txt" not in os.listdir(dir):
-        dir = os.path.join(dir, os.path.pardir)
-    return os.path.abspath(dir)
+  # Database libraries
+  for f in "$YCSB_HOME"/"$BINDING_DIR"-binding/lib/*.jar ; do
+    if [ -r "$f" ] ; then
+      CLASSPATH="$CLASSPATH:$f"
+    fi
+  done
 
-def is_distribution():
-    # If there's a top level pom, we're a source checkout. otherwise a dist artifact
-    return "pom.xml" not in os.listdir(get_ycsb_home())
+# Source checkout
+else
+  # Check for some basic libraries to see if the source has been built.
+  if ! ls "$YCSB_HOME"/core/target/*.jar 1> /dev/null 2>&1 || \
+     ! ls "$YCSB_HOME"/"$BINDING_DIR"/target/*.jar 1>/dev/null 2>&1; then
+    # Call mvn to build source checkout.
+    if [ "$BINDING_NAME" = "basic" ] ; then
+      MVN_PROJECT=core
+    else
+      MVN_PROJECT="$BINDING_DIR"-binding
+    fi
 
-# Run the maven dependency plugin to get the local jar paths.
-# presumes maven can run, so should only be run on source checkouts
-# will invoke the 'package' goal for the given binding in order to resolve intra-project deps
-# presumes maven properly handles system-specific path separators
-# Given module is full module name eg. 'core' or 'couchbase-binding'
-def get_classpath_from_maven(module):
-    try:
-        debug("Running 'mvn -pl site.ycsb:" + module + " -am package -DskipTests "
-              "dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'")
-        mvn_output = check_output(["mvn", "-pl", "site.ycsb:" + module,
-                                   "-am", "package", "-DskipTests",
-                                   "dependency:build-classpath",
-                                   "-DincludeScope=compile",
-                                   "-Dmdep.outputFilterFile=true"])
-        # the above outputs a "classpath=/path/tojar:/path/to/other/jar" for each module
-        # the last module will be the datastore binding
-        line = [x for x in mvn_output.splitlines() if x.startswith("classpath=")][-1:]
-        return line[0][len("classpath="):]
-    except subprocess.CalledProcessError, err:
-        error("Attempting to generate a classpath from Maven failed "
-              "with return code '" + str(err.returncode) + "'. The output from "
-              "Maven follows, try running "
-              "'mvn -DskipTests package dependency:build=classpath' on your "
-              "own and correct errors." + os.linesep + os.linesep + "mvn output:" + os.linesep
-              + err.output)
-        sys.exit(err.returncode)
+    echo "[WARN] YCSB libraries not found.  Attempting to build..."
+    if mvn -Psource-run -pl site.ycsb:"$MVN_PROJECT" -am package -DskipTests; then
+      echo "[ERROR] Error trying to build project. Exiting."
+      exit 1;
+    fi
+  fi
 
-def main():
-    p = argparse.ArgumentParser(
-            usage=usage(),
-            formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('-cp', dest='classpath', help="""Additional classpath
-                   entries, e.g.  '-cp /tmp/hbase-1.0.1.1/conf'. Will be
-                   prepended to the YCSB classpath.""")
-    p.add_argument("-jvm-args", default=[], type=shlex.split,
-                   help="""Additional arguments to pass to 'java', e.g.
-                   '-Xmx4g'""")
-    p.add_argument("command", choices=sorted(COMMANDS),
-                   help="""Command to run.""")
-    p.add_argument("database", choices=sorted(DATABASES),
-                   help="""Database to test.""")
-    args, remaining = p.parse_known_args()
-    ycsb_home = get_ycsb_home()
+  # Core libraries
+  for f in "$YCSB_HOME"/core/target/*.jar ; do
+    if [ -r "$f" ] ; then
+      CLASSPATH="$CLASSPATH:$f"
+    fi
+  done
 
-    # Use JAVA_HOME to find java binary if set, otherwise just use PATH.
-    java = "java"
-    java_home = os.getenv("JAVA_HOME")
-    if java_home:
-        java = os.path.join(java_home, "bin", "java")
-    db_classname = DATABASES[args.database]
-    command = COMMANDS[args.command]["command"]
-    main_classname = COMMANDS[args.command]["main"]
+  # Core dependency libraries
+  for f in "$YCSB_HOME"/core/target/dependency/*.jar ; do
+    if [ -r "$f" ] ; then
+      CLASSPATH="$CLASSPATH:$f"
+    fi
+  done
 
-    # Classpath set up
-    binding = args.database.split("-")[0]
+  # Database conf (need to find because location is not consistent)
+  CLASSPATH_CONF=$(find "$YCSB_HOME"/$BINDING_DIR -name "conf" | while IFS="" read -r file; do echo ":$file"; done)
+  if [ "x$CLASSPATH_CONF" != "x" ]; then
+    CLASSPATH="$CLASSPATH$CLASSPATH_CONF"
+  fi
 
-    if binding == "cassandra2":
-        warn("The 'cassandra2-cql' client has been deprecated. It has been "
-             "renamed to simply 'cassandra-cql'. This alias will be removed"
-             " in the next YCSB release.")
-        binding = "cassandra"
+  # Database libraries
+  for f in "$YCSB_HOME"/"$BINDING_DIR"/target/*.jar ; do
+    if [ -r "$f" ] ; then
+      CLASSPATH="$CLASSPATH:$f"
+    fi
+  done
 
-    if binding == "couchbase":
-        warn("The 'couchbase' client has been deprecated. If you are using "
-             "Couchbase 4.0+ try using the 'couchbase2' client instead.")
+  # Database dependency libraries
+  for f in "$YCSB_HOME"/"$BINDING_DIR"/target/dependency/*.jar ; do
+    if [ -r "$f" ] ; then
+      CLASSPATH="$CLASSPATH:$f"
+    fi
+  done
+fi
 
-    if binding == "hbase14":
-        warn("The 'hbase14' client has been deprecated. HBase 1.y users should "
-             "rely on the 'hbase1' client instead.")
-        binding = "hbase1"
+# Couchbase deprecation message
+if [ "${BINDING_DIR}" = "couchbase" ] ; then
+  echo "[WARN] The 'couchbase' client is deprecated. If you are using \
+Couchbase 4.0+ try using the 'couchbase2' client instead."
+fi
 
-    if binding == "arangodb3":
-        warn("The 'arangodb3' client has been deprecated. The binding 'arangodb' "
-             "now covers every ArangoDB version. This alias will be removed "
-             "in the next YCSB release.")
-        binding = "arangodb"
+# For Cygwin, switch paths to Windows format before running java
+if $CYGWIN; then
+  [ -n "$JAVA_HOME" ] && JAVA_HOME=$(cygpath --unix "$JAVA_HOME")
+  [ -n "$CLASSPATH" ] && CLASSPATH=$(cygpath --path --windows "$CLASSPATH")
+fi
 
-    if is_distribution():
-        db_dir = os.path.join(ycsb_home, binding + "-binding")
-        # include top-level conf for when we're a binding-specific artifact.
-        # If we add top-level conf to the general artifact, starting here
-        # will allow binding-specific conf to override (because it's prepended)
-        cp = [os.path.join(ycsb_home, "conf")]
-        cp.extend(find_jars(os.path.join(ycsb_home, "lib")))
-        cp.extend(find_jars(os.path.join(db_dir, "lib")))
-    else:
-        warn("Running against a source checkout. In order to get our runtime "
-             "dependencies we'll have to invoke Maven. Depending on the state "
-             "of your system, this may take ~30-45 seconds")
-        db_location = "core" if (binding == "basic" or binding == "basicts") else binding
-        project = "core" if (binding == "basic" or binding == "basicts") else binding + "-binding"
-        db_dir = os.path.join(ycsb_home, db_location)
-        # goes first so we can rely on side-effect of package
-        maven_says = get_classpath_from_maven(project)
-        # TODO when we have a version property, skip the glob
-        cp = find_jars(os.path.join(db_dir, "target"),
-                       project + "*.jar")
-        # alredy in jar:jar:jar form
-        cp.append(maven_says)
-    cp.insert(0, os.path.join(db_dir, "conf"))
-    classpath = os.pathsep.join(cp)
-    if args.classpath:
-        classpath = os.pathsep.join([args.classpath, classpath])
+# Get the rest of the arguments
+YCSB_ARGS=$(echo "$@" | cut -d' ' -f3-)
 
-    ycsb_command = ([java] + args.jvm_args +
-                    ["-cp", classpath,
-                     main_classname, "-db", db_classname] + remaining)
-    if command:
-        ycsb_command.append(command)
-    print >> sys.stderr, " ".join(ycsb_command)
-    try:
-        return subprocess.call(ycsb_command)
-    except OSError as e:
-        if e.errno == errno.ENOENT:
-            error('Command failed. Is java installed and on your PATH?')
-            return 1
-        else:
-            raise
+# About to run YCSB
+echo "$JAVA_HOME/bin/java $JAVA_OPTS -classpath $CLASSPATH $YCSB_CLASS $YCSB_COMMAND -db $BINDING_CLASS $YCSB_ARGS"
 
-if __name__ == '__main__':
-    sys.exit(main())
+# Run YCSB
+# Shellcheck reports the following line as needing double quotes to prevent
+# globbing and word splitting.  However, word splitting is the desired effect
+# here.  So, the shellcheck error is disabled for this line.
+# shellcheck disable=SC2086
+"$JAVA_HOME/bin/java" $JAVA_OPTS -classpath "$CLASSPATH" $YCSB_CLASS $YCSB_COMMAND -db $BINDING_CLASS $YCSB_ARGS
+
